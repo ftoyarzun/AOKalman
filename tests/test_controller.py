@@ -256,6 +256,49 @@ def test_gain_margin_keeps_kalman_stable_when_wfs_gain_rises():
     assert out[2.0][0] < 0.7 and out[2.0][1].mode == "kalman"
 
 
+def test_warm_start_switches_controller_without_bootstrap():
+    # an AR(1) Kalman runs; a new AR(3) controller takes over from its
+    # telemetry, without going back to the integrator
+    phi, noise = make_atmosphere(6000, A_SLOW, 0.1, 0.05)
+    ctrl1 = AdaptiveKalmanController(
+        config(identification="prediction_error", ar_order=1, max_updates=1), "cpu", DTYPE)
+    u1 = torch.zeros(N_MODES, dtype=DTYPE)
+    u2 = torch.zeros(N_MODES, dtype=DTYPE)
+    Z, U, res = [], [], []
+    ctrl = ctrl1
+    for k in range(2, 6000):
+        if k == 4000:
+            ctrl2 = AdaptiveKalmanController(
+                config(identification="prediction_error", ar_order=3, max_updates=1), "cpu", DTYPE)
+            assert ctrl2.warm_start(torch.stack(Z[-2000:]), torch.stack(U[-2000:]))
+            assert ctrl2.mode == "kalman" and ctrl2.model.A.shape == (3 * N_MODES, 3 * N_MODES)
+            # telemetry y_k = z_k + u_{k-2}, and the command history of the loop
+            y = torch.stack(Z[-1998:]) + torch.stack(U[-2000:-2])
+            torch.testing.assert_close(ctrl2.telemetry(), y)
+            torch.testing.assert_close(ctrl2.U[0], U[-1])
+            torch.testing.assert_close(ctrl2.U[1], U[-2])
+            ctrl = ctrl2
+        res.append(phi[k] - u1)
+        z = phi[k - 1] - u2 + noise[k]
+        u = ctrl.step(z).clone()
+        Z.append(z)
+        U.append(u)
+        u2, u1 = u1, u
+    res = torch.stack(res)
+    res_true = run_loop(true_model_controller(A_SLOW, 0.1, 0.05), phi, noise)
+    # no transient at the switch, and as good as the true model afterwards
+    assert res[3998:4100].pow(2).mean() < 1.5 * res_true[3998:4100].pow(2).mean()
+    assert res[4500:].pow(2).mean() < 1.05 * res_true[4500:].pow(2).mean()
+
+
+def test_warm_start_input_checks():
+    ctrl = AdaptiveKalmanController(config(identification="prediction_error"), "cpu", DTYPE)
+    with pytest.raises(ValueError):
+        ctrl.warm_start(torch.zeros(10, N_MODES), torch.zeros(9, N_MODES))
+    with pytest.raises(ValueError):
+        ctrl.warm_start(torch.zeros(2, N_MODES), torch.zeros(2, N_MODES))
+
+
 def test_no_model_accepted_when_unidentifiable():
     # SNR r/q = 225 after frame 3000: 2000 frames cannot separate Q from R,
     # so the new models are rejected and the fallback keeps the integrator

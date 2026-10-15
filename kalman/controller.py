@@ -395,6 +395,49 @@ class AdaptiveKalmanController:
                 and (self.frame - c.window) % c.update_period == 0):
             self.reidentify()
 
+    def warm_start(self, z, u):
+        """
+        Start from closed-loop telemetry recorded by another controller
+        (e.g. an AR(1) Kalman, to switch to AR(p) without going back to the
+        integrator), instead of the integrator bootstrap: fill the command
+        history and the telemetry window, then identify a model at once.
+
+            y_k = z_k / wfs_gain + u_{k-delay}
+
+        is computed with this controller's wfs_gain and delay, so the gain
+        can be one measured in the regime of the recorded frames.
+
+        Parameters
+        ----------
+        z : torch.Tensor
+            Measurements as given to `step`, shape [N_frames, n_modes].
+        u : torch.Tensor
+            Commands applied by the loop, u_k computed from z_k,
+            shape [N_frames, n_modes]. N_frames > delay.
+
+        Returns
+        -------
+        accepted : bool
+            Whether a model was accepted (the controller is then in "kalman"
+            mode; otherwise it stays in "bootstrap" and its integrator goes
+            on from the last command).
+        """
+        c, n = self.config, self.n
+        kw = dict(device=self.device, dtype=self.dtype)
+        z, u = z.to(**kw).reshape(-1, n), u.to(**kw).reshape(-1, n)
+        if z.shape != u.shape or z.shape[0] <= c.delay:
+            raise ValueError(f"z and u must have the same shape [N > {c.delay}, {n}], "
+                             f"got {tuple(z.shape)} and {tuple(u.shape)}")
+        y = (z * self.inv_wfs_gain)[c.delay:] + u[:-c.delay]
+        W = min(c.window, y.shape[0])
+        self.T[:W].copy_(y[-W:])
+        self.T_idx.fill_(W % c.window)
+        self.frame = W
+        m = min(self.U.shape[0], u.shape[0])
+        self.U.zero_()
+        self.U[:m].copy_(u.flip(0)[:m])                    # U[j] = u_{k-1-j}
+        return self.reidentify()
+
     def telemetry(self):
         """
         Pseudo-open-loop telemetry y_k = z_k + u_{k-delay}, oldest first.
