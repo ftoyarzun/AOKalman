@@ -52,13 +52,13 @@ def run_loop(ctrl, phi, noise, start=2, stop=None):
     return torch.stack(res)
 
 
-def true_model_controller(a, q_std, r_std):
-    """Controller running the true steady-state model from frame 0."""
+def true_model_controller(a, q_std, r_std, **kw):
+    """Controller running the true steady-state model from frame 0 (kw: config options)."""
     A = torch.diag(torch.as_tensor(a, dtype=DTYPE))
     I = torch.eye(A.shape[0], dtype=DTYPE)
     dare = steady_state_gain(A, I, q_std**2 * I, r_std**2 * I, compute_dtype=DTYPE)
     M = build_realtime_matrix(A, I, dare.K, 2, whiten=innovation_whitener(I, dare.P, r_std**2 * I))
-    ctrl = AdaptiveKalmanController(config(max_updates=0), "cpu", DTYPE)
+    ctrl = AdaptiveKalmanController(config(max_updates=0, **kw), "cpu", DTYPE)
     ctrl.load_matrix(M)
     return ctrl
 
@@ -188,6 +188,72 @@ def test_nis_patience_ignores_a_short_burst(patience):
         assert "fallback" in events
     else:
         assert "fallback" not in events and ctrl.mode == "kalman"
+
+
+def end_window(ctrl, nis):
+    """Close a monitor window whose mean NIS / n_modes is `nis`."""
+    ctrl.nis_sum.fill_(nis * ctrl.config.nis_window * ctrl.n)
+    ctrl._nis_frames = ctrl.config.nis_window
+    ctrl._check_nis()
+    return ctrl.history[-1]["event"] if ctrl.history else None
+
+
+def test_nis_patience_counts_again_after_recovery():
+    ctrl = true_model_controller(A_SLOW, 0.1, 0.3, allow_integrator_fallback=True, nis_patience=2)
+    events = []
+    for nis in (5.0, 5.0, 0.5, 5.0, 5.0):
+        n_before = len(ctrl.history)
+        end_window(ctrl, nis)
+        events.append(ctrl.history[-1]["event"] if len(ctrl.history) > n_before else None)
+    # high, high -> fallback; low under the integrator -> recovered;
+    # then patience again: one alarm before the next fallback
+    assert events == ["nis_alarm", "fallback", "recovered", "nis_alarm", "fallback"]
+
+
+def test_recover_on_new_model_only():
+    ctrl = true_model_controller(A_SLOW, 0.1, 0.3, allow_integrator_fallback=True,
+                                 recover_on="new_model")
+    M = ctrl._M[ctrl._active].clone()
+    end_window(ctrl, 5.0)
+    assert ctrl.mode == "integrator"
+    end_window(ctrl, 0.1)                 # low NIS under the integrator: no recovery
+    assert ctrl.mode == "integrator" and float(ctrl.alpha) == 0.0
+    ctrl.load_matrix(M)                   # a new model
+    assert ctrl.mode == "kalman" and ctrl.history[-1]["event"] == "recovered"
+    with pytest.raises(ValueError):
+        AdaptiveKalmanController(config(recover_on="other"), "cpu", DTYPE)
+
+
+def run_loop_kalman_gain(ctrl, phi, noise, rho):
+    """run_loop where the WFS gain is rho while the Kalman controls (a pyramid
+    whose optical gain rises as the residual drops) and 1 otherwise."""
+    u1 = torch.zeros(phi.shape[1], dtype=DTYPE)
+    u2 = torch.zeros(phi.shape[1], dtype=DTYPE)
+    res = []
+    for k in range(2, phi.shape[0]):
+        res.append(phi[k] - u1)
+        g = rho if ctrl.mode == "kalman" else 1.0
+        z = g * (phi[k - 1] - u2 + noise[k])
+        u = ctrl.step(z).clone()
+        u2, u1 = u1, u
+    return torch.stack(res)
+
+
+def test_gain_margin_keeps_kalman_stable_when_wfs_gain_rises():
+    # the WFS gain doubles once the Kalman controls: with wfs_gain at the
+    # gain measured under the integrator the pseudo-open loop rings (high
+    # NIS, worse than the integrator); with a 2x margin it stays far better
+    phi, noise = make_atmosphere(8000, [0.999, 0.998, 0.995, 0.99], 0.05, 0.01)
+    res_int = run_loop(IntegratorController(N_MODES, 0.2, 0.99, dtype=DTYPE), phi, noise)
+    out = {}
+    for margin in (1.0, 2.0):
+        ctrl = AdaptiveKalmanController(
+            config(identification="prediction_error", max_updates=1, integrator_gain=0.2,
+                   wfs_gain=margin), "cpu", DTYPE)
+        res = run_loop_kalman_gain(ctrl, phi, noise, 2.0)
+        out[margin] = (res[3000:].pow(2).mean() / res_int[3000:].pow(2).mean(), ctrl)
+    assert out[1.0][0] > 1.5
+    assert out[2.0][0] < 0.7 and out[2.0][1].mode == "kalman"
 
 
 def test_no_model_accepted_when_unidentifiable():

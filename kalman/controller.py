@@ -48,7 +48,11 @@ class AdaptiveKalmanConfig:
         Gain of the WFS measurement with respect to the command, scalar or
         per mode [n_modes] (e.g. measured with a dither). The filter uses
         z / wfs_gain, so that the pseudo-open-loop measurement is in command
-        units; the integrator uses z as given.
+        units; the integrator uses z as given. Overestimating the gain is
+        the safe side: if the true gain is rho times wfs_gain, the pseudo-
+        open loop rings at ~fs/4 for rho -> 2 and diverges above. A pyramid's
+        optical gain rises when the Kalman reduces the residual, so a gain
+        measured under the integrator should get a margin (~2x).
     delay : int
         Frames between the command computation and the measurement it
         affects: the physical pseudo-open-loop pairing is
@@ -134,7 +138,15 @@ class AdaptiveKalmanConfig:
         short disturbance burst that the Kalman handles better than the
         integrator.
     nis_recover : float
-        Leave the fallback when mean(NIS) / n_modes drops below this.
+        Leave the fallback when mean(NIS) / n_modes drops below this
+        (recover_on="nis").
+    recover_on : str
+        "nis": leave the fallback when the NIS, computed while the
+        integrator runs, drops below nis_recover. "new_model": only when a
+        new model is accepted. Use "new_model" when the model fits the data
+        under the integrator but not under the Kalman (e.g. a pyramid whose
+        optical gain rises as the residual drops): the NIS is then always
+        low under the integrator, and "nis" cycles between both modes.
     use_cuda_graph : bool
         Capture the real-time step as a CUDA graph (CUDA only).
     """
@@ -176,6 +188,7 @@ class AdaptiveKalmanConfig:
     nis_threshold: float = 2.0
     nis_patience: int = 1
     nis_recover: float = 1.3
+    recover_on: str = "nis"
     use_cuda_graph: bool = False
 
 
@@ -231,6 +244,8 @@ class AdaptiveKalmanController:
             raise ValueError(f"Unknown identification {c.identification!r}; "
                              "use 'covariance' or 'prediction_error'")
         self.n = n
+        if c.recover_on not in ("nis", "new_model"):
+            raise ValueError(f"Unknown recover_on {c.recover_on!r}; use 'nis' or 'new_model'")
 
         kw = dict(device=self.device, dtype=dtype)
         gain = torch.as_tensor(c.wfs_gain, **kw)
@@ -506,6 +521,14 @@ class AdaptiveKalmanController:
                 self.v[j * n:(j + 1) * n].copy_(y[-1 - j])
 
     def _check_nis(self):
+        """
+        End of a monitor window (`nis_window` frames): log the mean NIS.
+        Fall back to the integrator after `nis_patience` windows in a row
+        with NIS / n_modes > nis_threshold. With recover_on="nis", go back
+        to the Kalman when the NIS (computed while the integrator runs)
+        drops below nis_recover; with "new_model", only when a new model is
+        accepted (`load_matrix`).
+        """
         c = self.config
         nis = float(self.nis_sum) / (self._nis_frames * self.n)
         self.nis_sum.zero_()
@@ -516,14 +539,16 @@ class AdaptiveKalmanController:
             if c.allow_integrator_fallback and self._nis_high >= c.nis_patience:
                 self.alpha.fill_(0.0)
                 self.mode = "integrator"
+                self._nis_high = 0
                 self.history.append({"frame": self.frame, "event": "fallback", "nis": nis})
             else:
                 self.history.append({"frame": self.frame, "event": "nis_alarm", "nis": nis})
         elif self.mode == "kalman":
             self._nis_high = 0
-        elif self.mode == "integrator" and nis < c.nis_recover:
+        elif self.mode == "integrator" and c.recover_on == "nis" and nis < c.nis_recover:
             self.alpha.fill_(1.0)
             self.mode = "kalman"
+            self._nis_high = 0
             self.history.append({"frame": self.frame, "event": "recovered", "nis": nis})
 
 
