@@ -3,7 +3,8 @@ Adaptive modal Kalman controller for real-time use.
 
 Real-time path (one call to `step` per frame, no host synchronization):
 
-    y_k = z_k + u_{k - pol_lag}                     pseudo-open-loop measurement
+    y_k = z_k / g + u_{k - pol_lag}                 pseudo-open-loop measurement
+                                                    (g: WFS gain, per mode)
     [x_{k|k}; u_k^KF; e_k] = M @ [x_{k-1|k-1}; y_k] one GEMV (`build_realtime_matrix`)
     u_k^I = leak * u_{k-1} + gain * z_k             integrator (always computed)
     u_k = alpha * u_k^KF + (1 - alpha) * u_k^I      alpha in {0, 1}
@@ -19,7 +20,7 @@ frame never sees a half-written matrix. With CUDA graphs, one graph is
 captured per buffer, so the swap is also just the index flip.
 """
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 
@@ -27,6 +28,7 @@ from kalman.Kalman_tools import (
     RecursiveCovariance,
     autocovariances,
     build_realtime_matrix,
+    identify_ar_model,
     identify_model,
     innovation_whitener,
     lagged_covariances,
@@ -42,6 +44,11 @@ class AdaptiveKalmanConfig:
 
     n_modes : int
         Number of controlled modes (measurement and command size).
+    wfs_gain : float or torch.Tensor
+        Gain of the WFS measurement with respect to the command, scalar or
+        per mode [n_modes] (e.g. measured with a dither). The filter uses
+        z / wfs_gain, so that the pseudo-open-loop measurement is in command
+        units; the integrator uses z as given.
     delay : int
         Frames between the command computation and the measurement it
         affects: the physical pseudo-open-loop pairing is
@@ -58,6 +65,24 @@ class AdaptiveKalmanConfig:
     max_updates : int or None
         Stop re-identifying after this many accepted models (1 = fixed model
         identified once). None: never stop.
+    identification : str
+        "covariance"
+            AR(1) (+ optional AR(2) modes) from lag covariances, with
+            Q = Q_raw - R - A R A^T (`identify_model`). Supports
+            `forgetting`, A structures and `ar2_modes`, but Q collapses to
+            0 (K_ii = 0) in drifting modes of real telemetry.
+        "prediction_error"
+            Per-mode AR(`ar_order`) models by least squares on the window,
+            Q = variance of the one-step prediction errors (positive by
+            construction), R = R_fraction * Q (`identify_ar_model`).
+            Recommended on the bench. Needs `forgetting=None` and no
+            `ar2_modes`; the A_* options other than A_max_radius are unused.
+    ar_order : int
+        AR order p for "prediction_error" (state size n_modes * p).
+    R_fraction : float
+        R_ii / Q_ii for "prediction_error" when R_fixed is None. 0.1 suits a
+        low-noise WFS (the RAMA bench); when WFS noise dominates the
+        one-step prediction error, set R_fixed or a larger fraction.
     forgetting : float or None
         If set, identify from `RecursiveCovariance` with this forgetting
         factor instead of the last `window` frames.
@@ -65,7 +90,9 @@ class AdaptiveKalmanConfig:
         Passed to `estimate_A_from_covariances`.
     A_max_radius : float or None
         Shrink A to this spectral radius (`limit_spectral_radius`) instead
-        of rejecting models whose short-window estimate overshoots 1.
+        of rejecting models whose short-window estimate overshoots 1. With
+        "prediction_error", the roots of each mode's AR polynomial
+        (`limit_ar_radius`).
     R_fixed : torch.Tensor or None
         Known WFS noise covariance [n_modes, n_modes]; estimated from
         telemetry if None.
@@ -82,6 +109,9 @@ class AdaptiveKalmanConfig:
         Largest autocovariance lag for the AR(2) instrumental variable.
     max_spectral_radius, max_negative_Q_fraction
         Passed to `validate_model`.
+    min_kalman_gain : float or None
+        Reject models with K_ii below this in any mode (`validate_model`,
+        min_gain): such a mode is never corrected. None: no check.
     dare_tol, dare_max_iter, dare_dtype
         Passed to `steady_state_gain`.
     ident_dtype : torch.dtype
@@ -92,23 +122,33 @@ class AdaptiveKalmanConfig:
         monitor only logs. (Before the first model, the integrator always
         runs, to collect telemetry.)
     integrator_gain, integrator_leak : float
-        u_k = leak * u_{k-1} + gain * z_k.
+        u_k = leak * u_{k-1} + gain * z_k (z as given, not divided by
+        wfs_gain). integrator_gain may also be a tensor [n_modes].
     nis_window : int
         Frames averaged by the NIS monitor.
     nis_threshold : float
         Fallback when mean(NIS) / n_modes exceeds this (1 = consistent).
+    nis_patience : int
+        Number of consecutive NIS windows above nis_threshold before the
+        fallback (earlier ones only log "nis_alarm"). 2 or more ignores a
+        short disturbance burst that the Kalman handles better than the
+        integrator.
     nis_recover : float
         Leave the fallback when mean(NIS) / n_modes drops below this.
     use_cuda_graph : bool
         Capture the real-time step as a CUDA graph (CUDA only).
     """
     n_modes: int
+    wfs_gain: Union[float, torch.Tensor] = 1.0
     delay: int = 2
     pol_lag: Optional[int] = None
     command_lead: Optional[int] = None
     window: int = 1000
     update_period: int = 500
     max_updates: Optional[int] = None
+    identification: str = "covariance"
+    ar_order: int = 1
+    R_fraction: float = 0.1
     forgetting: Optional[float] = None
     A_method: str = "instrumental_variable"
     A_structure: str = "full"
@@ -124,15 +164,17 @@ class AdaptiveKalmanConfig:
     ar2_max_lag: int = 20
     max_spectral_radius: float = 0.9999
     max_negative_Q_fraction: float = 0.2
+    min_kalman_gain: Optional[float] = 1e-3
     dare_tol: float = 1e-5
     dare_max_iter: int = 64
     dare_dtype: torch.dtype = torch.float32
     ident_dtype: torch.dtype = torch.float32
     allow_integrator_fallback: bool = False
-    integrator_gain: float = 0.3
+    integrator_gain: Union[float, torch.Tensor] = 0.3
     integrator_leak: float = 0.995
     nis_window: int = 200
     nis_threshold: float = 2.0
+    nis_patience: int = 1
     nis_recover: float = 1.3
     use_cuda_graph: bool = False
 
@@ -176,10 +218,26 @@ class AdaptiveKalmanController:
         self.ar2 = None
         if c.ar2_modes is not None and len(c.ar2_modes) > 0:
             self.ar2 = torch.as_tensor(c.ar2_modes, dtype=torch.long, device=self.device)
-        s = 0 if self.ar2 is None else self.ar2.numel()
-        self.n, self.ns = n, n + s
+        if c.identification == "prediction_error":
+            if c.forgetting is not None or self.ar2 is not None:
+                raise ValueError('identification="prediction_error" needs forgetting=None '
+                                 'and no ar2_modes (use ar_order)')
+            if c.ar_order < 1:
+                raise ValueError("ar_order must be >= 1")
+            self.ns = n * c.ar_order
+        elif c.identification == "covariance":
+            self.ns = n + (0 if self.ar2 is None else self.ar2.numel())
+        else:
+            raise ValueError(f"Unknown identification {c.identification!r}; "
+                             "use 'covariance' or 'prediction_error'")
+        self.n = n
 
         kw = dict(device=self.device, dtype=dtype)
+        gain = torch.as_tensor(c.wfs_gain, **kw)
+        if bool((gain <= 0).any()):
+            raise ValueError("wfs_gain must be > 0")
+        self.inv_wfs_gain = (1 / gain).expand(n).clone()    # [n]
+        self.int_gain = torch.as_tensor(c.integrator_gain, **kw)
         rows, cols = self.ns + 2 * n, self.ns + n
         self._M = [torch.zeros(rows, cols, **kw), torch.zeros(rows, cols, **kw)]
         self._active = 0
@@ -202,6 +260,7 @@ class AdaptiveKalmanController:
         self.history = []
         self.nis_log = []
         self._nis_frames = 0
+        self._nis_high = 0                                   # consecutive windows above threshold
 
         self.rcov = None
         if c.forgetting is not None:
@@ -225,12 +284,13 @@ class AdaptiveKalmanController:
     def _rt_body(self, M):
         c, n, ns = self.config, self.n, self.ns
         U = self.U
-        y_filter = self.z + U[self.pol_lag - 1]
-        y_ident = self.z + U[c.delay - 1]
+        z_cmd = self.z * self.inv_wfs_gain                  # residual in command units
+        y_filter = z_cmd + U[self.pol_lag - 1]
+        y_ident = z_cmd + U[c.delay - 1]
         self.v[ns:].copy_(y_filter)
         torch.mv(M, self.v, out=self.out)
         self.v[:ns].copy_(self.out[:ns])
-        u_int = c.integrator_leak * U[0] + c.integrator_gain * self.z
+        u_int = c.integrator_leak * U[0] + self.int_gain * self.z
         u = torch.lerp(u_int, self.out[ns:ns + n], self.alpha)
         for j in range(U.shape[0] - 1, 0, -1):
             U[j].copy_(U[j - 1])
@@ -359,21 +419,30 @@ class AdaptiveKalmanController:
         """
         c = self.config
         try:
-            C, g = self._covariances()
-            model = identify_model(
-                C, A_method=c.A_method, A_structure=c.A_structure,
-                groups=c.groups, ridge=c.ridge, A_max_radius=c.A_max_radius,
-                R=None if c.R_fixed is None else c.R_fixed.to(C[0]),
-                R_structure=c.R_structure, Q_structure=c.Q_structure,
-                R_min_fraction=c.R_min_fraction,
-                ar2_modes=self.ar2, ar2_method=c.ar2_method, autocov=g,
-            )
+            if c.identification == "prediction_error":
+                y = self.telemetry().to(c.ident_dtype)
+                model = identify_ar_model(
+                    y, c.ar_order, max_radius=c.A_max_radius,
+                    R=None if c.R_fixed is None else c.R_fixed.to(y),
+                    R_fraction=c.R_fraction,
+                )
+            else:
+                C, g = self._covariances()
+                model = identify_model(
+                    C, A_method=c.A_method, A_structure=c.A_structure,
+                    groups=c.groups, ridge=c.ridge, A_max_radius=c.A_max_radius,
+                    R=None if c.R_fixed is None else c.R_fixed.to(C[0]),
+                    R_structure=c.R_structure, Q_structure=c.Q_structure,
+                    R_min_fraction=c.R_min_fraction,
+                    ar2_modes=self.ar2, ar2_method=c.ar2_method, autocov=g,
+                )
             dare = steady_state_gain(model.A, model.H, model.Q, model.R,
                                      tol=c.dare_tol, max_iter=c.dare_max_iter,
                                      compute_dtype=c.dare_dtype, on_fail="ignore")
             check = validate_model(model.A, model.Q_unclipped, model.R, dare,
                                    max_spectral_radius=c.max_spectral_radius,
-                                   max_negative_Q_fraction=c.max_negative_Q_fraction)
+                                   max_negative_Q_fraction=c.max_negative_Q_fraction,
+                                   min_gain=c.min_kalman_gain)
         except (RuntimeError, torch.linalg.LinAlgError) as err:
             self.history.append({"frame": self.frame, "event": "rejected",
                                  "reasons": (f"identification failed: {err}",)})
@@ -414,6 +483,7 @@ class AdaptiveKalmanController:
         self._active = inactive
         self.nis_sum.zero_()
         self._nis_frames = 0
+        self._nis_high = 0
         if self.mode != "kalman":
             if self.mode == "bootstrap":
                 self._init_state()
@@ -426,9 +496,14 @@ class AdaptiveKalmanController:
         y = self.telemetry()
         if y.shape[0] == 0:
             return
-        self.v[:self.n].copy_(y[-1])
+        n = self.n
+        self.v[:n].copy_(y[-1])
         if self.ar2 is not None and y.shape[0] > 1:
-            self.v[self.n:self.ns].copy_(y[-2][self.ar2])
+            self.v[n:self.ns].copy_(y[-2][self.ar2])
+        if self.config.identification == "prediction_error":
+            # stacked state [x_k; x_{k-1}; ...; x_{k-p+1}]
+            for j in range(1, min(self.config.ar_order, y.shape[0])):
+                self.v[j * n:(j + 1) * n].copy_(y[-1 - j])
 
     def _check_nis(self):
         c = self.config
@@ -437,12 +512,15 @@ class AdaptiveKalmanController:
         self._nis_frames = 0
         self.nis_log.append((self.frame, nis))
         if self.mode == "kalman" and nis > c.nis_threshold:
-            if c.allow_integrator_fallback:
+            self._nis_high += 1
+            if c.allow_integrator_fallback and self._nis_high >= c.nis_patience:
                 self.alpha.fill_(0.0)
                 self.mode = "integrator"
                 self.history.append({"frame": self.frame, "event": "fallback", "nis": nis})
             else:
                 self.history.append({"frame": self.frame, "event": "nis_alarm", "nis": nis})
+        elif self.mode == "kalman":
+            self._nis_high = 0
         elif self.mode == "integrator" and nis < c.nis_recover:
             self.alpha.fill_(1.0)
             self.mode = "kalman"

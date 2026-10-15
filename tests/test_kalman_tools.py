@@ -8,7 +8,13 @@ from kalman.Kalman_tools import (
     apply_structure,
     ar2_noise_variance,
     ar2_state,
+    ar_companion,
+    ar_prediction_errors,
+    ar_spectral_radius,
     augment_ar2,
+    estimate_ar,
+    identify_ar_model,
+    limit_ar_radius,
     autocovariances,
     build_realtime_matrix,
     estimate_ar2,
@@ -720,3 +726,80 @@ def test_limit_spectral_radius():
 
     stable = 0.5 * torch.eye(3, dtype=torch.float64)
     torch.testing.assert_close(limit_spectral_radius(stable, 0.99), stable)
+
+
+# -------------------------------------------------------------
+# Per-mode AR(p) models from prediction errors
+# -------------------------------------------------------------
+
+def test_estimate_ar_recovers_ar2_coefficients(generator):
+    a1, a2 = resonance([17.0, 43.0, 5.0], 1000.0, 0.99)
+    x = simulate_ar2(a1, a2, 0.1, 20000, generator)
+
+    coef, e = estimate_ar(x, 2)
+
+    torch.testing.assert_close(coef[:, 0], a1, atol=0.01, rtol=0)
+    torch.testing.assert_close(coef[:, 1], a2, atol=0.01, rtol=0)
+    assert e.shape == (20000 - 2, 3)
+    torch.testing.assert_close(e.var(0), torch.full((3,), 0.01, dtype=torch.float64), atol=0, rtol=0.05)
+    torch.testing.assert_close(e, ar_prediction_errors(x, coef))
+
+
+def test_estimate_ar_order_1_is_diagonal_least_squares(generator):
+    x = simulate_ar1(torch.tensor([0.99, 0.9, 0.5], dtype=torch.float64), 0.1, 5000, generator)
+    coef, _ = estimate_ar(x, 1)
+    torch.testing.assert_close(torch.diag(coef[:, 0]), estimate_A(x, method="diagonal"))
+
+
+def test_limit_ar_radius_scales_roots():
+    # roots 1.02 and 0.5 (unstable), and a stable mode left unchanged
+    coef = torch.tensor([[1.52, -0.51], [0.9, -0.2]], dtype=torch.float64)
+    rho = ar_spectral_radius(coef)
+    torch.testing.assert_close(rho[0], torch.tensor(1.02, dtype=torch.float64))
+
+    out = limit_ar_radius(coef, 0.99)
+
+    rho_out = ar_spectral_radius(out)
+    torch.testing.assert_close(rho_out[0], torch.tensor(0.99, dtype=torch.float64))
+    torch.testing.assert_close(out[1], coef[1])
+
+
+def test_ar_companion_matches_recursion(generator):
+    coef = torch.tensor([[1.2, -0.3, 0.05], [0.5, 0.2, 0.1]], dtype=torch.float64)
+    A, H = ar_companion(coef)
+    assert A.shape == (6, 6) and H.shape == (2, 6)
+    x = torch.randn(3, 2, generator=generator, dtype=torch.float64)   # x_k, x_{k-1}, x_{k-2}
+    X = x.reshape(-1)
+    nxt = coef[:, 0] * x[0] + coef[:, 1] * x[1] + coef[:, 2] * x[2]
+    torch.testing.assert_close(H @ (A @ X), nxt)
+    torch.testing.assert_close((A @ X)[2:], X[:4])                 # shift register
+
+
+def test_identify_ar_model_q_positive_r_relative(generator):
+    # a drifting mode (random walk) plus AR(1) modes: Q stays positive
+    a = torch.tensor([1.0, 0.99, 0.9], dtype=torch.float64)
+    x = simulate_ar1(a, 0.1, 4000, generator) + 0.05 * torch.randn(4000, 3, generator=generator, dtype=torch.float64)
+
+    m = identify_ar_model(x, 3, max_radius=0.999, R_fraction=0.2)
+
+    q = torch.diagonal(m.Q)[:3]
+    assert m.A.shape == (9, 9) and m.H.shape == (3, 9)
+    assert bool((q > 0).all())
+    torch.testing.assert_close(m.R, torch.diag(0.2 * q))
+    assert float(torch.linalg.eigvals(m.A).abs().max()) <= 0.999 + 1e-9
+    torch.testing.assert_close(m.Q_unclipped, m.Q)
+    dare = steady_state_gain(m.A, m.H, m.Q, m.R, compute_dtype=torch.float64)
+    assert validate_model(m.A, m.Q, m.R, dare, min_gain=1e-3).ok
+
+
+def test_validate_model_rejects_zero_gain_mode(generator):
+    A, H, Q, R = random_model(generator)
+    Q = torch.diag(torch.diagonal(Q))
+    A = torch.diag(torch.diagonal(A))
+    Q[1, 1] = 0.0                       # Q collapse in mode 1: K_11 = 0
+    dare = steady_state_gain(A, H, Q, R, compute_dtype=torch.float64)
+
+    check = validate_model(A, Q, R, dare, min_gain=1e-3)
+
+    assert not check.ok and "modes [1]" in check.reasons[-1]
+    assert validate_model(A, Q, R, dare).ok          # min_gain=None: no check

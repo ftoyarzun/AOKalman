@@ -120,7 +120,9 @@ def test_telemetry_is_physical_pseudo_open_loop():
 
 def test_kalman_path_equals_realtime_step():
     phi, noise = make_atmosphere(3000, A_SLOW, 0.1, 0.3)
-    ctrl = AdaptiveKalmanController(config(max_updates=1), "cpu", DTYPE)
+    # mechanics only: the covariance model of this window has K_ii = 0 in
+    # one mode (rejected by default), but any accepted matrix will do here
+    ctrl = AdaptiveKalmanController(config(max_updates=1, min_kalman_gain=None), "cpu", DTYPE)
     run_loop(ctrl, phi, noise, stop=2500)
     m = ctrl.model
     M = build_realtime_matrix(m.A, m.H, ctrl.dare.K, 2)
@@ -172,6 +174,22 @@ def test_nis_monitor_fallback_switch(allow):
         assert ctrl.mode == "kalman"
 
 
+@pytest.mark.parametrize("patience", [1, 2])
+def test_nis_patience_ignores_a_short_burst(patience):
+    phi, noise = make_atmosphere(4000, A_SLOW, 0.1, 0.3)
+    noise[3000:3200] *= 5        # one NIS window (frames 3000-3200) of bad data
+    ctrl = AdaptiveKalmanController(
+        config(max_updates=1, min_kalman_gain=None, allow_integrator_fallback=True,
+               nis_patience=patience), "cpu", DTYPE)
+    run_loop(ctrl, phi, noise)
+    events = [h["event"] for h in ctrl.history]
+    assert "nis_alarm" in events or "fallback" in events
+    if patience == 1:
+        assert "fallback" in events
+    else:
+        assert "fallback" not in events and ctrl.mode == "kalman"
+
+
 def test_no_model_accepted_when_unidentifiable():
     # SNR r/q = 225 after frame 3000: 2000 frames cannot separate Q from R,
     # so the new models are rejected and the fallback keeps the integrator
@@ -218,13 +236,79 @@ def test_ar2_modes_and_pol_lag_options():
     assert ctrl1.mode == "kalman"
 
 
+@pytest.mark.parametrize("order", [1, 3])
+def test_prediction_error_identification_close_to_true_model(order):
+    # low WFS noise, as on the bench: R = R_fraction * Q is then a good model
+    phi, noise = make_atmosphere(6000, A_SLOW, 0.1, 0.05)
+    ctrl = AdaptiveKalmanController(
+        config(identification="prediction_error", ar_order=order), "cpu", DTYPE)
+    res_kf = run_loop(ctrl, phi, noise)
+    res_true = run_loop(true_model_controller(A_SLOW, 0.1, 0.05), phi, noise)
+    assert ctrl.history[0] == {**ctrl.history[0], "frame": 2000, "event": "accepted"}
+    assert ctrl.mode == "kalman" and ctrl.model.A.shape == (N_MODES * order, N_MODES * order)
+    assert res_kf[3000:].pow(2).mean() < 1.05 * res_true[3000:].pow(2).mean()
+    assert all(0.7 < nis < 1.3 for _, nis in ctrl.nis_log[-5:])
+
+
+def run_loop_gain(ctrl, phi, noise, gain):
+    """run_loop with a WFS of gain `gain` (per mode): z = gain * (phi_{k-1} - u_{k-2} + n_k)."""
+    u1 = torch.zeros(phi.shape[1], dtype=DTYPE)
+    u2 = torch.zeros(phi.shape[1], dtype=DTYPE)
+    res = []
+    for k in range(2, phi.shape[0]):
+        res.append(phi[k] - u1)
+        z = gain * (phi[k - 1] - u2 + noise[k])
+        u = ctrl.step(z).clone()
+        u2, u1 = u1, u
+    return torch.stack(res)
+
+
+@pytest.mark.parametrize("identification", ["covariance", "prediction_error"])
+def test_wfs_gain_normalization(identification):
+    # a WFS of gain g with wfs_gain=g (and the integrator gain divided by g)
+    # is the same loop as a WFS of gain 1
+    phi, noise = make_atmosphere(4000, A_SLOW, 0.1, 0.05)
+    g = torch.tensor([0.2, 0.25, 0.3, 0.45], dtype=DTYPE)
+    kw = dict(identification=identification, ar_order=2 if identification == "prediction_error" else 1)
+    ctrl_g = AdaptiveKalmanController(
+        config(wfs_gain=g, integrator_gain=0.4 / g, **kw), "cpu", DTYPE)
+    ctrl_1 = AdaptiveKalmanController(config(**kw), "cpu", DTYPE)
+    res_g = run_loop_gain(ctrl_g, phi, noise, g)
+    res_1 = run_loop(ctrl_1, phi, noise)
+    assert ctrl_g.mode == "kalman"
+    torch.testing.assert_close(res_g, res_1, atol=1e-8, rtol=1e-6)
+    torch.testing.assert_close(ctrl_g.telemetry(), ctrl_1.telemetry(), atol=1e-8, rtol=1e-6)
+
+
+def test_prediction_error_option_checks():
+    with pytest.raises(ValueError):
+        AdaptiveKalmanController(
+            config(identification="prediction_error", forgetting=0.999), "cpu", DTYPE)
+    with pytest.raises(ValueError):
+        AdaptiveKalmanController(
+            config(identification="prediction_error", ar2_modes=(0,)), "cpu", DTYPE)
+    with pytest.raises(ValueError):
+        AdaptiveKalmanController(config(identification="other"), "cpu", DTYPE)
+    with pytest.raises(ValueError):
+        AdaptiveKalmanController(config(wfs_gain=0.0), "cpu", DTYPE)
+
+
+def test_zero_gain_mode_rejected_by_default():
+    # this window gives the covariance model K_ii = 0 in mode 1 (Q collapse)
+    phi, noise = make_atmosphere(3000, A_SLOW, 0.1, 0.3)
+    ctrl = AdaptiveKalmanController(config(max_updates=1), "cpu", DTYPE)
+    run_loop(ctrl, phi, noise, stop=2500)
+    assert ctrl.history[0]["event"] == "rejected"
+    assert "K_ii" in ctrl.history[0]["reasons"][-1]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_cuda_graph_matches_eager():
     phi, noise = make_atmosphere(3000, A_SLOW, 0.1, 0.3)
     outs = []
     for graph in (False, True):
         cfg = config(use_cuda_graph=graph, ident_dtype=torch.float32,
-                     dare_dtype=torch.float32)
+                     dare_dtype=torch.float32, min_kalman_gain=None)   # mechanics only
         ctrl = AdaptiveKalmanController(cfg, "cuda", torch.float32)
         u1 = torch.zeros(N_MODES, device="cuda")
         u2 = torch.zeros(N_MODES, device="cuda")

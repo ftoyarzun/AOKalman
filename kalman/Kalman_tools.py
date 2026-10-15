@@ -1074,6 +1074,7 @@ def validate_model(
     dare=None,
     max_spectral_radius=0.9999,
     max_negative_Q_fraction=0.2,
+    min_gain=None,
 ):
     """
     Sanity checks before a re-identified model replaces the running one:
@@ -1084,6 +1085,9 @@ def validate_model(
           clipping, is at most `max_negative_Q_fraction` of the total
         - R positive definite
         - the DARE converged (if `dare` is given)
+        - every measured mode has K_ii >= min_gain (if `dare` and `min_gain`
+          are given). A mode with K_ii ~ 0 (Q_ii clipped to 0) is never
+          corrected: its command drifts open loop.
 
     Parameters
     ----------
@@ -1100,6 +1104,9 @@ def validate_model(
         Upper bound on max |eig(A)|.
     max_negative_Q_fraction : float
         Upper bound on the negative spectral mass of Q.
+    min_gain : float or None
+        Lower bound on K_ii for the measured modes, i < N_meas (the state
+        starts with the measured modes: H = I or [I, 0]).
 
     Returns
     -------
@@ -1129,6 +1136,11 @@ def validate_model(
         dare_converged = dare.converged
         if not dare.converged:
             reasons.append(f"DARE did not converge (residual {dare.residual:.2e})")
+        if min_gain is not None:
+            m = dare.K.shape[1]
+            low = torch.nonzero(torch.diagonal(dare.K[:m, :m]) < min_gain).flatten().tolist()
+            if low:
+                reasons.append(f"K_ii < {min_gain} in modes {low}")
 
     return ModelCheck(len(reasons) == 0, tuple(reasons), rho, neg, dare_converged)
 
@@ -1553,3 +1565,204 @@ def identify_model(
     Q_un = estimate_Q_ar2_from_covariances(C, A_aug, modes, R, force_positive=False)
     Q_un[:n, :n] = apply_structure(Q_un[:n, :n], Q_structure, groups)
     return IdentifiedModel(A_aug, H_aug, _clip_psd(Q_un), R, Q_un, A)
+
+
+# =============================================================
+# Per-mode AR(p) models from prediction errors
+# =============================================================
+#
+# Each mode i follows its own AR(p) model
+#
+#     x_i[k+1] = c_i1 x_i[k] + c_i2 x_i[k-1] + ... + c_ip x_i[k-p+1] + w_i[k]
+#
+# fitted by least squares on a window of pseudo-open-loop telemetry. Q is the
+# variance of the actual one-step prediction errors, so it is positive by
+# construction, unlike Q_raw - R - A R A^T from lag covariances, which goes
+# negative for drifting modes and collapses their gain to K_ii = 0. With a
+# real WFS, the telemetry estimate of R is unreliable (correlated innovations,
+# unknown units), so R is set relative to Q (R_ii = R_fraction * Q_ii).
+
+def estimate_ar(x, order):
+    """
+    Per-mode AR(p) coefficients by least squares, and the prediction errors:
+
+        x_i[k+1] = sum_j c_ij x_i[k-j+1] + e_i[k],   j = 1 .. p
+
+    Solved with a batched QR (one p x p problem per mode), which is better
+    conditioned than the normal equations for smooth, strongly correlated
+    lags.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Pseudo-open-loop telemetry, shape [N_frames, N_modes].
+    order : int
+        p >= 1.
+
+    Returns
+    -------
+    coef : torch.Tensor
+        c_ij, shape [N_modes, p] (column j-1 multiplies x[k-j+1]).
+    e : torch.Tensor
+        One-step prediction errors, shape [N_frames - p, N_modes].
+    """
+    if order < 1:
+        raise ValueError("order must be >= 1")
+    N = x.shape[0]
+    if N <= 2 * order:
+        raise ValueError(f"need more than {2 * order} frames for an AR({order}) fit")
+    # X[i, k, j] = x_i[k + p - 1 - j], target t[i, k] = x_i[k + p]
+    X = torch.stack([x[order - 1 - j: N - 1 - j] for j in range(order)], dim=-1).transpose(0, 1)
+    t = x[order:].T.unsqueeze(-1)
+    Qm, Rm = torch.linalg.qr(X)
+    coef = torch.linalg.solve_triangular(Rm, Qm.transpose(1, 2) @ t, upper=True).squeeze(-1)
+    return coef, ar_prediction_errors(x, coef)
+
+
+def ar_prediction_errors(x, coef):
+    """
+    One-step prediction errors of per-mode AR(p) models.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Shape [N_frames, N_modes].
+    coef : torch.Tensor
+        Shape [N_modes, p].
+
+    Returns
+    -------
+    e : torch.Tensor
+        e[k] = x[k + p] - sum_j c_j x[k + p - j], shape [N_frames - p, N_modes].
+    """
+    p, N = coef.shape[1], x.shape[0]
+    pred = sum(coef[:, j] * x[p - 1 - j: N - 1 - j] for j in range(p))
+    return x[p:] - pred
+
+
+def ar_spectral_radius(coef):
+    """
+    Largest root modulus of each mode's AR polynomial
+    z^p - c_1 z^{p-1} - ... - c_p.
+
+    Parameters
+    ----------
+    coef : torch.Tensor
+        Shape [N_modes, p].
+
+    Returns
+    -------
+    rho : torch.Tensor
+        Shape [N_modes].
+    """
+    n, p = coef.shape
+    comp = torch.zeros(n, p, p, device=coef.device, dtype=coef.dtype)
+    comp[:, 0, :] = coef
+    if p > 1:
+        idx = torch.arange(p - 1, device=coef.device)
+        comp[:, idx + 1, idx] = 1
+    return torch.linalg.eigvals(comp).abs().amax(dim=-1).to(coef.dtype)
+
+
+def limit_ar_radius(coef, max_radius):
+    """
+    Shrink the roots of each mode's AR polynomial to modulus <= max_radius:
+    scaling every root by r is c_j -> c_j r^j.
+
+    Parameters
+    ----------
+    coef : torch.Tensor
+        Shape [N_modes, p].
+    max_radius : float
+
+    Returns
+    -------
+    coef : torch.Tensor
+        Shape [N_modes, p].
+    """
+    rho = ar_spectral_radius(coef)
+    r = torch.clamp(max_radius / rho, max=1.0)
+    j = torch.arange(1, coef.shape[1] + 1, device=coef.device, dtype=coef.dtype)
+    return coef * r[:, None] ** j[None, :]
+
+
+def ar_companion(coef):
+    """
+    State-space form of per-mode AR(p) models, with the stacked state
+    X_k = [x_k; x_{k-1}; ...; x_{k-p+1}]:
+
+        A = [[diag(c_1), diag(c_2), ..., diag(c_p)],
+             [I,         0,         ..., 0        ],
+             ...
+             [0,         ...,       I,   0        ]]
+        H = [I, 0, ..., 0]
+
+    Parameters
+    ----------
+    coef : torch.Tensor
+        Shape [N_modes, p].
+
+    Returns
+    -------
+    A : torch.Tensor
+        Shape [N_modes p, N_modes p].
+    H : torch.Tensor
+        Shape [N_modes, N_modes p].
+    """
+    n, p = coef.shape
+    kw = dict(device=coef.device, dtype=coef.dtype)
+    A = torch.zeros(n * p, n * p, **kw)
+    for j in range(p):
+        A[:n, j * n:(j + 1) * n] = torch.diag(coef[:, j])
+    if p > 1:
+        A[n:, :-n] = torch.eye(n * (p - 1), **kw)
+    H = torch.zeros(n, n * p, **kw)
+    H[:, :n] = torch.eye(n, **kw)
+    return A, H
+
+
+def identify_ar_model(x, order, max_radius=None, R=None, R_fraction=0.1):
+    """
+    Identify per-mode AR(p) models from a window of pseudo-open-loop
+    telemetry:
+
+        1. c_ij by least squares (`estimate_ar`), roots shrunk to
+           max_radius if given (`limit_ar_radius`)
+        2. Q_ii = var(e_i), e the one-step prediction errors of the final
+           coefficients (positive by construction)
+        3. R = R_fraction * diag(Q), unless R is given
+        4. companion form (`ar_companion`)
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Pseudo-open-loop telemetry, shape [N_frames, N_modes].
+    order : int
+        AR order p.
+    max_radius : float or None
+        Largest root modulus of each mode's AR polynomial.
+    R : torch.Tensor or None
+        Known noise covariance [N_modes, N_modes].
+    R_fraction : float
+        R_ii / Q_ii when R is None (> 0, the DARE needs R^{-1}).
+
+    Returns
+    -------
+    IdentifiedModel
+        A [n p, n p], H [n, n p], Q [n p, n p] (only the first block is
+        non-zero), R [n, n], Q_unclipped = Q, A_ar1 = diag(c_1).
+    """
+    coef, e = estimate_ar(x, order)
+    if max_radius is not None:
+        coef = limit_ar_radius(coef, max_radius)
+        e = ar_prediction_errors(x, coef)
+    n = x.shape[1]
+    q = e.var(dim=0)
+    if R is None:
+        if R_fraction <= 0:
+            raise ValueError("R_fraction must be > 0")
+        R = torch.diag(R_fraction * q)
+    A, H = ar_companion(coef)
+    Q = torch.zeros_like(A)
+    Q[:n, :n] = torch.diag(q)
+    return IdentifiedModel(A, H, Q, R, Q, A[:n, :n].clone())
