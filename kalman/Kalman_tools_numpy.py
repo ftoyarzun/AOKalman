@@ -262,3 +262,29 @@ def kalman_filter(
     )
 
     return KalmanState(x=x_new, P=P_new), K
+
+def to_ar_state(measurement, N=2):
+    """
+    Build an augmented AR(N) state from a measurement vector.
+
+    Parameters
+    ----------
+    measurement : ndarray [M] or [B, M]
+        Measurement sequence.
+
+    N : int
+        AR order. Must be >= 1.
+
+    Returns
+    -------
+    ndarray
+        [N*M] if measurement is [M], or [B, N*M] if [B, M].
+        Ordering: [d_k, d_{k-1}, ..., d_{k-N+1}].
+    """
+    if N < 2:
+        return measurement
+
+    history = [measurement[N-j:-j] for j in range(1, N)]
+    vectors = [measurement[N:], *history]
+
+    return np.concatenate(vectors, axis=-1)
