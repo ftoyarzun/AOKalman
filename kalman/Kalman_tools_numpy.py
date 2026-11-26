@@ -186,6 +186,7 @@ def kalman_filter(
     measurement: np.ndarray,
     state: KalmanState,
     matrices: KalmanMatrices,
+    K = None
 ) -> tuple[KalmanState, np.ndarray]:
     """
     Perform one Kalman filter iteration.
@@ -229,24 +230,33 @@ def kalman_filter(
 
     x_pred = A @ state.x
 
+    innovation = measurement - H @ x_pred
+    
+    if K is not None:
+        x_new = x_pred + K @ innovation
+        return KalmanState(x=x_new, P=state.P), K
+
     P_pred = A @ state.P @ A.T + Q
 
     # ---------------------------------------------------------
     # Measurement update
     # ---------------------------------------------------------
 
-    innovation = measurement - H @ x_pred
+    
+
 
     S = H @ P_pred @ H.T + R
 
     # K = P_pred @ H.T @ inv(S)
     # Use solve rather than explicitly computing inv(S).
+
     K = np.linalg.solve(
         S,
         H @ P_pred,
     ).T
 
     x_new = x_pred + K @ innovation
+
 
     # Joseph form for numerical stability
     I = np.eye(
